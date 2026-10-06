@@ -1,0 +1,28 @@
+# Agent manifest — the registry entry point.
+# Every key is read at ROOT level; do NOT nest keys under an `agent:` block.
+# Runtime tuning lives in config/config.yaml, not here.
+id: "CMN-C2-277"
+name: "FreeeAccountingEntryAgent"
+namespace: "cmn"
+version: "0.1.0"
+enabled: true
+category: "Cat 2"
+generation_mode: "llm"  # deterministic | llm
+industry: "CMN"
+
+# Descriptive pattern label (metadata only; the class inherits AgentBaseGraph).
+base_type: "ToolCallingAgent"
+
+# Entry point — single dotted import path (module.Class), NOT split module:/class:.
+class: "src.graph.graph.FreeeAccountingEntryAgent"
+
+required_trust_level: "VERIFIED_EXTERNAL"
+
+# Compile-time gates — declare every ctx.secrets.require() key + constructed extra.
+# Optional LLM enhancement (ClassifyIntentNode / InferFreeeFieldsNode): any
+# failure (missing secret, API error, malformed response) degrades to the
+# deterministic heuristic/regex baseline — see docs/02_design.md
+# "Implementation Note — LLM synthesis".
+requires:
+  secrets: ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT"]
+  extras: ["openai"]

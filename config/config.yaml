@@ -1,0 +1,10 @@
+# Runtime parameters — loaded by AgentRegistry, passed as Graph(config=...).
+# Separate from config/agent.yaml (the static manifest).
+
+max_retry: 3
+timeout_s: 30
+
+# freee integration settings, forwarded to the inner workflow graph.
+freee:
+  base_url: "https://api.freee.co.jp/api/1"
+  company_id: ""

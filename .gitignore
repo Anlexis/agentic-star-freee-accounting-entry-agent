@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+.env
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# Reference files placed locally at project setup time. They are not part of
+# this repository and must not be tracked.
+CLAUDE.md
+security_rules/
+ci_stubs/
+MANIFEST.md

@@ -1,0 +1,84 @@
+# Test Specification - CMN-C2-277 freee Accounting Entry Agent
+
+## Test Strategy
+
+- Test types: Unit (per node + service + config + caller-data contract + inner graph) /
+  Proof-of-Boundary (full outer-graph invoke, the real ASGI entry point, output containment,
+  import isolation, state safety, server boot, HITL stub).
+- Location: `tests/unit/`, `tests/proof_of_boundary/` (`tests/integration/` is an empty package;
+  end-to-end coverage lives in the boundary tests, which drive the real compiled graph).
+- The freee call is exercised through the deterministic, network-free stub transport (default) and
+  through monkeypatched fake clients; no live freee call is ever made.
+- **Trust-gate routing canon**: every per-node unit test invokes the node as `node(state)` -
+  `BaseNode.__call__` routes the full security pipeline (trust gate -> PII mask -> `execute()` ->
+  credential scan) - never bare `node.execute(state)`. State builders set `caller_trust_level =
+  TrustLevel.VERIFIED_EXTERNAL.value` for PreProcessNode (the single external gate) and
+  `TrustLevel.ANONYMOUS.value` for every other node. Two documented exceptions:
+  `CallFreeeApiNode.execute(state, config=...)` (a 2nd argument `__call__` cannot forward), and
+  `tests/unit/test_caller_data_contract.py`, which calls `execute()` DIRECTLY on purpose - see
+  below. The trust-rejection test asserts on the RETURNED error dict (`status ==
+  AgentStatus.ERROR.value`, "trust gate denied" in `error_log`, execute-only keys absent);
+  `__call__` never raises for a trust denial.
+- **Why the caller-data contract is tested through a bare `execute()`**: the template must own its
+  refusals rather than inherit them from an upstream gate. A test that asserts "the framework
+  refused it" passes only where that framework gate is active, and returns SUCCESS - fail OPEN -
+  where it is absent or configured off. Those tests therefore put no wrapper in front of the node,
+  and assert behaviour (error status, nothing carried forward, the value never echoed) rather than
+  any gate's wording.
+- Assertion contract: the invoke surface is `result["output"]` / `status` / `trace_id` /
+  `correlation_id` / `node_history` (never `formatted_output` at the invoke surface); status is
+  compared to `AgentStatus.SUCCESS`/`.value` (lowercase `success`/`error`); the outer graph is
+  called as `invoke(user_input=..., ctx=..., input_context=...)`; identifiers may be masked
+  (`[MASKED]`) so record evidence is asserted by presence, not raw repr; audit spies assert on
+  `call.args[1]` (the event payload), never the whole-call repr.
+- Framework pipeline behaviours encoded by the suite: `__call__` short-circuits on an incoming
+  errored state (execute() is skipped; error status/error_log pass through); the framework PII mask
+  rewrites Title-Case bigrams (across newlines), emails, and long digit runs in
+  `user_input`/`validated_input` to `[MASKED]` before `execute()` sees the text - positive payloads
+  are PII-free (journal numbers and amounts in fixtures stay <= 4 digits), intentional-PII tests
+  assert the `[MASKED]` path, and the caller-data channel exists precisely because that mask
+  corrupts structured accounting data.
+- Domain audit events are muted per module via an autouse fixture patching
+  `src.nodes.<mod>.emit_trace_event` (never a `sys.modules` stub of `shared.*`).
+
+## Unit Tests (`tests/unit/`)
+
+| TC-ID | Test file | Focus | Expected |
+|-------|-----------|-------|----------|
+| U-01 | test_trust_gate.py | trust boundary: ANONYMOUS caller on the VERIFIED_EXTERNAL pre_process gate; inner nodes ANONYMOUS; trust-posture declarations; trust ordering (VERIFIED_EXTERNAL clears an ANONYMOUS gate); deny path emits no domain audit event | denial RETURNS an error dict (`status == AgentStatus.ERROR.value`, "trust gate denied" in error_log, execute-only keys absent); VERIFIED_EXTERNAL passes; every inner node declares ANONYMOUS |
+| U-02 | test_pre_process_node.py | serialize NL request + journal-entry hint into `validated_input` (JSON); HTML strip; hint priority entry_id > entry_hint > journal_id | hint resolved by priority; `<script>` stripped; empty/missing -> `status=error` |
+| U-03 | test_caller_data_contract.py | the caller-data contract owned by the node, via a bare `execute()`: hint shape and priority; structured journal fields against their bounds; unsupported field; inert-charset labels probed in BOTH directions (real Japanese/ASCII account titles accepted, markup/quotes refused); a parametrized non-finite matrix per numeric field; the injection screen (control tokens, override phrasing, hostile field NAMES, `\u`-escaped payloads, markup-spliced directives, raw and post-sanitize) | every malformed value fails CLOSED naming the field; the rejected value and the hostile payload are never echoed; real bookkeeping language is never refused |
+| U-04 | test_validate_input_node.py | empty/short guard; JSON-shaped input; framework `[MASKED]` path for emails; node-level token flag-and-redact (`secret_*`) | email -> `[MASKED]` before execute; token -> `[REDACTED]` + `redaction_flags=["token"]` (JSON string); empty/short -> error; audit payload carries flags only |
+| U-05 | test_classify_intent_node.py | intent = lookup_entry / create_entry / check_balance (keyword, writes-first priority, read-only default); **optional LLM override** (test-double `llm=` injection, no real Azure call): valid response overrides the heuristic, prose/markdown-fenced JSON extracted, malformed/missing-key response falls back, an intent outside the closed 3-way set is rejected, an exception falls back, no secret configured falls back, empty input never calls the LLM | correct intent per keyword; no-signal defaults to lookup_entry with a non-fatal note; empty -> error; audit emits the intent label + `llm_inferred` flag only; every LLM-failure mode returns the heuristic result with `status=SUCCESS`, never raises |
+| U-06 | test_infer_freee_fields_node.py | journal-entry-number resolution (text > id-shaped hint; never invented); quoted account title; `Key: value` journal fields; freee `manual_journal` payload per intent (JSON string); create assembles journal lines ONLY when debit + credit + an in-range amount are all explicit; **optional LLM gap-fill** (test-double `llm=` injection, no real Azure call): fills a field the regex found nothing for, regex wins on any conflict (financial-write safety), an LLM-supplied amount still goes through the identical range validation (never booked if out of range), an LLM-supplied entry number never overrides an explicit text match, malformed response / exception / no secret all fall back to regex-only, empty input never calls the LLM | lookup `{journal_id}`; create `manual_journal.details` debit/credit pair + issue_date; partial create -> `details == []` (never invented); check_balance `{account}` from quoted title or non-id hint; unresolved number left `""`; empty input -> error; every LLM-failure mode (and every conflict) falls back to the regex-only result, never raises |
+| U-07 | test_call_freee_api_node.py | lookup/create/balance via the network-free stub; `freee_config` state field + `execute(state, config=...)` override; API error / not-found / unresolved number / incomplete journal / unresolved account / unsupported intent / missing payload; secret posture (a live transport refuses to run unauthenticated; token read via `ctx.secrets`, never env/state); the configured call deadline; **closed-set error reasons** (no-match reason omits the entry number; API-error reason carries the HTTP status not the upstream body; transport-failure reason carries no exception text or URL; clean-call control) | record_id/record_ref on success; an upstream 403 surfaces as its status code only (never the upstream body); incomplete journal refused ("never invented"); live+no-secret -> error "unauthenticated"; live+bound secret -> token passed to the client; a late result is discarded; an unusable deadline falls back to the default rather than to none; audit emits presence signals with `stub_transport=True`; every error_log entry carries a closed-set label only (error_log is the internal channel — the audit trail and the framework's own result scan read it; the caller never does) |
+| U-08 | test_confirm_node.py | human-readable confirmation per intent verb; ref/id/balance formatting; title fallback | "Retrieved/Created journal entry ... ref=... id=..." / "Retrieved account balance ... balance=..."; missing evidence -> error |
+| U-09 | test_post_process_node.py | `formatted_output` shaping (JSON payload round-trip); errored state passes through `__call__` unmasked (short-circuit); the output gate as a full-node path AND as a direct function call: record-evidence rule, credential-shaped values, the NESTED walk with its top-level control and a clean negative control, and the containment clear; **existing-ERROR path containment** (envelope present AND truthy; no record_id/record_ref/account_title/balance in the shipped envelope; every output-bearing field cleared in the delta; error status still reported; nothing of error_log in the envelope; clean-path control so the containment assertions cannot pass vacuously); **closed-set error envelope** (parametrised over every non-success path — inner error, inner error with a credential in error_log, missing record evidence, credential nested in the payload, credential-shaped mapping KEY with a clean value and with a credential value: key set `{reason}`, every value in `ERROR_REASONS`, truthy, every output-bearing field cleared; an upstream-shaped sentinel seeded in error_log appears in no key and no value of the returned mapping at any depth; the reason code names the path taken; inner entries are not re-emitted; gate violations travel in error_log only; a credential-shaped key is withheld from the violation label through the real `node(state)` pipeline, so the framework's own credential scan lets the cleared delta through; clean-response control carries no reason code) | success shape with parsed `freee_payload`; error status/error_log preserved, no success shape fabricated; SUCCESS without record_id/record_ref blocked; a credential nested inside the request body — or riding a mapping key — blocked with the field PATH (never the value; a credential-shaped key is labelled `<withheld>`); EVERY non-success return goes through the one module-level `_contain()`: it clears every output-bearing field (`result`/`confirmation`/`record_id`/`record_ref`/`entry_id`/`account_title`/`balance`/`freee_payload`/`intent`) and replaces the envelope with `{"reason": <code>}` — a constant from `ERROR_REASONS` and nothing else, never the error reasons; the gate path emits its own audit event and the contained error return emits `post_process_error_contained` (reason code + COUNT only) |
+| U-10 | test_freee_client.py | freee accounting REST API client: find/create journal + trial-balance; `Authorization: Bearer` header; `company_id` query param; `FreeeApiError` on non-2xx; stub shapes (`manual_journal` echo / synthetic id, `trial_bs.balances` row, `_stub` marker); `uses_stub_transport` | correct URLs/headers/bodies; 400 raises with joined `errors`; stub shapes are deterministic |
+| U-11 | test_config.py | `config/agent.yaml` manifest sanity + `config/config.yaml` runtime sanity | id CMN-C2-277, Cat 2, CMN, namespace cmn, flat (no `agent:` block), dotted entry point, VERIFIED_EXTERNAL; `requires.secrets` == exactly the three Azure OpenAI keys (FREEE_TOKEN absent — optional by contract, and declaring an unprovisioned secret fails the agent at compile time), `requires.extras == ["openai"]`; `freee.base_url` + `company_id`; `max_retry` + `timeout_s` |
+| U-12 | test_domain_workflow_graph.py | inner `FreeeWorkflowGraph`: identity, `_extra_initial_state()` config injection and caller-context seeding, `route()` error short-circuit, the `route()` annotation guard, `get_output` contract, compile, direct inner invoke on the stub | name/state_schema correct; config forwarded as a JSON string including the call deadline; the bridge seeds `entry_hint` + `caller_journal`; `route()` is annotated with the graph's OWN `State`; error -> END; inner invoke runs validate -> classify -> infer -> call -> confirm to SUCCESS with record evidence |
+| U-13 | test_framework_compliance_tc06_tc07.py | TC-06 / TC-07: the framework's `@final` input/output gates cannot be overridden by a domain node | overriding either raises at class definition |
+
+## Proof-of-Boundary Tests (`tests/proof_of_boundary/`)
+
+| PB-ID | Boundary | Test | Expected |
+|-------|----------|------|----------|
+| PB-4 | Import isolation | test_import_isolation.py | AST scan of `src/`: no platform-SDK imports |
+| PB-2/PB-5 | State serialization | test_state_safety.py | `state.py`: no Pydantic/credential fields |
+| PB-6 | Backbone invoke-order + external-trust | test_pb_invoke_order.py | `_VALID_PAYLOAD` byte-equal to `deploy/invoke_payload.json` "input" (asserted); a VERIFIED_EXTERNAL caller yields `status=success` with `node_history == [InitializeNode, PreProcessNode, FreeeWorkflowGraphNode, PostProcessNode, FinalizeNode]` and record evidence + confirmation in `result["output"]`; an ANONYMOUS caller is denied at pre_process (error, no post_process, no output); blank input -> error, not crash |
+| PB-7 | HITL interrupt propagation *(conditional)* | test_pb7_hitl_interrupt_propagation.py | **Auto-waived - non-HITL** (no `hitl.enabled: true` is declared): module-level skipif; the stub bodies are real AssertionErrors, so enabling HITL without implementing PB-7 fails loudly |
+| PB-8 | The real ASGI `/invoke` entry point | test_pb_invoke_endpoint.py | authenticated request -> a real confirmation computed from the request; caller journal fields reach the freee write INTACT while the same words in the text channel are masked (the bridge regression, with its control); absent caller data degrades to the text baseline; a numeric journal-entry number crosses the stack byte-identical; balance path; missing/wrong Bearer -> 401 with the generic body; oversized `input_context` -> 413; malformed caller metadata refused without echoing the value; a non-finite/out-of-range amount matrix refused; injection content refused with nothing booked; real bookkeeping language unaffected; no credential-shaped string anywhere in the nested response; **closed-set error envelope over the wire** — an upstream-shaped line seeded into error_log by patching one inner node's `execute()` on the real compiled agent (inner-error path via `CallFreeeApiNode`; gate-refusal path via `ConfirmNode` succeeding without record evidence) reaches no key and no value of the invoke body: no `error_log` key, inner-error `output` withheld, gate-refusal `output == {"reason": "output_withheld_by_gate"}`; a freee 403 whose body names a customer and echoes a token surfaces nowhere in the body; the unpatched control still ships the answer |
+| PB-9 | Output containment | test_pb_output_containment.py | the framework's response shaping falls back to `state["result"]` (asserted, because it is why clearing is required); a gate violation on the real compiled backbone ships NO released text, no traceback and no source path, and the caller's `output` is `{"reason": "output_withheld_by_gate"}` — closed-set labels only, none of the gate's findings; a stand-in main that seeds an upstream-shaped line into error_log proves the line reaches no key and no value of the invoke result on the gate-refusal path AND on the inner-error path (where `output` is withheld outright); the negative control proves a compliant answer still ships; every output-bearing field is in the clear list **for the gate path AND for the pre-existing-ERROR path** (the two are pinned to the same list — a field added to one and not the other is the defect molt found); and the compiled graph is asserted NOT to route an errored state through post_process, so the error-branch containment is documented as source-level defence in depth and a framework change that promoted it to live would fail a test |
+| PB (boot) | Server entry point | test_server_boot.py | importing `src.api.server` does not raise (construct + compile + provision_secrets at import); the agent constructs + compiles via the supported path; `/invoke` + `/health` routes exposed |
+
+> PB-1 (audit emission) is covered inside the unit suite via the emit-spy tests (validate /
+> classify / call nodes assert on the event payload, `call.args[1]`). PB-3 (live external service)
+> is exercised at deployment first-invoke, not in this suite - the shipped transport is the
+> documented network-free stub.
+
+## Test Execution Summary
+
+- Runner: `python -m pytest tests/ -v` against the real `agenticstar-agentcore` wheel the CI job
+  installs (never an import shim).
+- Total tests: 309
+- Pass: 307 / Fail: 0 / Skip: 2 (PB-7 A/B - auto-waived, non-HITL)
